@@ -2,10 +2,10 @@
 
 import math
 import copy
-import os
 import warnings
 import re
 import sys
+import requests
 
 import torch
 import torch.utils.checkpoint
@@ -53,84 +53,27 @@ CHATGLM_6B_PRETRAINED_MODEL_ARCHIVE_LIST = [
 
 class InvalidScoreLogitsProcessor(LogitsProcessor):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        if torch.isnan(scores).any() or torch.isinf(scores).any():
+        if torch.isnan(scores).any():
             scores.zero_()
             scores[..., 5] = 5e4
         return scores
 
 
-def load_tf_weights_in_chatglm_6b(model, config, tf_checkpoint_path):
-    """Load tf checkpoints in a pytorch model."""
-    try:
-        import re
+class ImagePatchEmbedding(torch.nn.Module):
+    def __init__(self, in_channels, hidden_size, patch_size):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
 
-        import numpy as np
-        import tensorflow as tf
-    except ImportError:
-        logger.error(
-            "Loading a TensorFlow model in PyTorch, requires TensorFlow to be installed. Please see "
-            "https://www.tensorflow.org/install/ for installation instructions."
-        )
-        raise
-    tf_path = os.path.abspath(tf_checkpoint_path)
-    logger.info(f"Converting TensorFlow checkpoint from {tf_path}")
-    # Load weights from TF model
-    init_vars = tf.train.list_variables(tf_path)
-    names = []
-    arrays = []
-    for name, shape in init_vars:
-        logger.info(f"Loading TF weight {name} with shape {shape}")
-        array = tf.train.load_variable(tf_path, name)
-        names.append(name)
-        arrays.append(array)
-
-    for name, array in zip(names, arrays):
-        name = name.split("/")
-        # adam_v and adam_m are variables used in AdamWeightDecayOptimizer to calculated m and v
-        # which are not required for using pretrained model
-        if any(
-                n in ["adam_v", "adam_m", "AdamWeightDecayOptimizer", "AdamWeightDecayOptimizer_1", "global_step"]
-                for n in name
-        ):
-            logger.info(f"Skipping {'/'.join(name)}")
-            continue
-        pointer = model
-        for m_name in name:
-            if re.fullmatch(r"[A-Za-z]+_\d+", m_name):
-                scope_names = re.split(r"_(\d+)", m_name)
-            else:
-                scope_names = [m_name]
-            if scope_names[0] == "kernel" or scope_names[0] == "gamma":
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "output_bias" or scope_names[0] == "beta":
-                pointer = getattr(pointer, "bias")
-            elif scope_names[0] == "output_weights":
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "squad":
-                pointer = getattr(pointer, "classifier")
-            else:
-                try:
-                    pointer = getattr(pointer, scope_names[0])
-                except AttributeError:
-                    logger.info(f"Skipping {'/'.join(name)}")
-                    continue
-            if len(scope_names) >= 2:
-                num = int(scope_names[1])
-                pointer = pointer[num]
-        if m_name[-11:] == "_embeddings":
-            pointer = getattr(pointer, "weight")
-        elif m_name == "kernel":
-            array = np.transpose(array)
-        try:
-            assert (
-                    pointer.shape == array.shape
-            ), f"Pointer shape {pointer.shape} and array shape {array.shape} mismatched"
-        except AssertionError as e:
-            e.args += (pointer.shape, array.shape)
-            raise
-        logger.info(f"Initialize PyTorch weight {name}")
-        pointer.data = torch.from_numpy(array)
-    return model
+    def forward(self, images):
+        """
+        Input:
+        * images with shape (B, C, H, W)
+        Output:
+        * (batch_size, hidden_size)
+        """
+        embeddings = self.proj(images)
+        embeddings = embeddings.flatten(2).transpose(1, 2)
+        return embeddings
 
 
 class PrefixEncoder(torch.nn.Module):
@@ -677,19 +620,29 @@ class ChatGLMPreTrainedModel(PreTrainedModel):
         """Initialize the weights."""
         return
 
-    def get_masks(self, input_ids, device):
+    def get_masks(self, input_ids, device, padding_mask=None):
         batch_size, seq_length = input_ids.shape
         context_lengths = [seq.tolist().index(self.config.bos_token_id) for seq in input_ids]
         attention_mask = torch.ones((batch_size, seq_length, seq_length), device=device)
         attention_mask.tril_()
         for i, context_length in enumerate(context_lengths):
             attention_mask[i, :, :context_length] = 1
+        if padding_mask is not None:
+            attention_mask = attention_mask * padding_mask.unsqueeze(1) * padding_mask.unsqueeze(2)
         attention_mask.unsqueeze_(1)
         attention_mask = (attention_mask < 0.5).bool()
 
         return attention_mask
 
-    def get_position_ids(self, input_ids, mask_positions, device, use_gmasks=None):
+    def get_position_ids(self, input_ids, device):
+        MASK, gMASK = self.config.mask_token_id, self.config.gmask_token_id
+        seqs = input_ids.tolist()
+        mask_positions, use_gmasks = [], []
+        for seq in seqs:
+            mask_token = gMASK if gMASK in seq else MASK
+            use_gmask = mask_token == gMASK
+            mask_positions.append(seq.index(mask_token))
+            use_gmasks.append(use_gmask)
         batch_size, seq_length = input_ids.shape
         if use_gmasks is None:
             use_gmasks = [False] * batch_size
@@ -891,6 +844,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             input_ids: Optional[torch.LongTensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
+            full_attention_mask: Optional[torch.Tensor] = None,
             past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
             inputs_embeds: Optional[torch.LongTensor] = None,
             use_cache: Optional[bool] = None,
@@ -914,7 +868,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
                 use_cache = False
 
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+            logger.warning_once("Specify both input_ids and inputs_embeds at the same time, will use inputs_embeds")
         elif input_ids is not None:
             batch_size, seq_length = input_ids.shape[:2]
         elif inputs_embeds is not None:
@@ -932,36 +886,28 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             else:
                 past_key_values = tuple([None] * len(self.layers))
 
-            if attention_mask is None:
-                attention_mask = self.get_masks(
+            if full_attention_mask is None:
+                full_attention_mask = self.get_masks(
                     input_ids,
-                    device=input_ids.device
+                    device=input_ids.device,
+                    padding_mask=attention_mask
                 )
-
 
             if position_ids is None:
-                MASK, gMASK = self.config.mask_token_id, self.config.gmask_token_id
-                seqs = input_ids.tolist()
-
-                mask_positions, use_gmasks = [], []
-                for seq in seqs:
-                    mask_token = gMASK if gMASK in seq else MASK
-                    use_gmask = mask_token == gMASK
-                    mask_positions.append(seq.index(mask_token))
-                    use_gmasks.append(use_gmask)
-
                 position_ids = self.get_position_ids(
                     input_ids,
-                    mask_positions=mask_positions,
                     device=input_ids.device,
-                    use_gmasks=use_gmasks
                 )
+        else:
+            if attention_mask is not None:
+                full_attention_mask = (attention_mask < 0.5).bool()
+                full_attention_mask = full_attention_mask.unsqueeze(1).unsqueeze(1)
 
-        if self.pre_seq_len is not None and attention_mask is not None:
+        if self.pre_seq_len is not None and full_attention_mask is not None:
             prefix_attention_mask = torch.ones(batch_size, 1, input_ids.size(-1), self.pre_seq_len).to(
-                attention_mask.device)
+                full_attention_mask.device)
             prefix_attention_mask = (prefix_attention_mask < 0.5).bool()
-            attention_mask = torch.cat((prefix_attention_mask, attention_mask), dim=3)
+            full_attention_mask = torch.cat((prefix_attention_mask, full_attention_mask), dim=3)
 
         # [seq_len, batch, hidden_size]
         hidden_states = inputs_embeds.transpose(0, 1)
@@ -970,10 +916,10 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        if attention_mask is None:
-            attention_mask = torch.zeros(1, 1, device=input_ids.device).bool()
+        if full_attention_mask is None:
+            full_attention_mask = torch.zeros(1, 1, device=input_ids.device).bool()
         else:
-            attention_mask = attention_mask.to(hidden_states.device)
+            full_attention_mask = full_attention_mask.to(hidden_states.device)
 
         for i, layer in enumerate(self.layers):
 
@@ -986,7 +932,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
                     layer,
                     hidden_states,
                     position_ids,
-                    attention_mask,
+                    full_attention_mask,
                     torch.tensor(i),
                     layer_past,
                     use_cache,
@@ -996,7 +942,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
                 layer_ret = layer(
                     hidden_states,
                     position_ids=position_ids,
-                    attention_mask=attention_mask,
+                    attention_mask=full_attention_mask,
                     layer_id=torch.tensor(i),
                     layer_past=layer_past,
                     use_cache=use_cache,
@@ -1067,11 +1013,11 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         self.lm_head = new_embeddings
 
     def _update_model_kwargs_for_generation(
-        self,
-        outputs: ModelOutput,
-        model_kwargs: Dict[str, Any],
-        is_encoder_decoder: bool = False,
-        standardize_cache_format: bool = False,
+            self,
+            outputs: ModelOutput,
+            model_kwargs: Dict[str, Any],
+            is_encoder_decoder: bool = False,
+            standardize_cache_format: bool = False,
     ) -> Dict[str, Any]:
         # update past_key_values
         model_kwargs["past_key_values"] = self._extract_past_from_model_output(
@@ -1081,14 +1027,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         # update attention mask
         if "attention_mask" in model_kwargs:
             attention_mask = model_kwargs["attention_mask"]
-            if attention_mask is not None and attention_mask.dtype == torch.bool:
-                attention_mask = torch.cat(
-                    [attention_mask, attention_mask.new_ones((*attention_mask.shape[:3], 1))], dim=3)
-                new_attention_mask = attention_mask[:, :, -1:].clone()
-                new_attention_mask[..., -1] = False
-                model_kwargs["attention_mask"] = torch.cat(
-                    [attention_mask, new_attention_mask], dim=2
-                )
+            model_kwargs["attention_mask"] = torch.cat(
+                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+            )
 
         # update position ids
         if "position_ids" in model_kwargs:
@@ -1110,34 +1051,12 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             position_ids: Optional[torch.Tensor] = None,
             **kwargs
     ) -> dict:
-        batch_size, seq_length = input_ids.shape
-        MASK, gMASK = self.config.mask_token_id, self.config.gmask_token_id
-        seqs = input_ids.tolist()
-        mask_positions, use_gmasks = [], []
-        for seq in seqs:
-            mask_token = gMASK if gMASK in seq else MASK
-            use_gmask = mask_token == gMASK
-            mask_positions.append(seq.index(mask_token))
-            use_gmasks.append(use_gmask)
-
         # only last token for input_ids if past is not None
         if past is not None or past_key_values is not None:
             last_token = input_ids[:, -1].unsqueeze(-1)
-            if attention_mask is not None and attention_mask.dtype == torch.bool:
-                attention_mask = attention_mask[:, :, -1:]
-            else:
-                attention_mask = None
-            if position_ids is not None:
-                position_ids = position_ids[..., -1:]
-            else:
-                context_lengths = [seq.index(self.config.bos_token_id) for seq in seqs]
-                if self.position_encoding_2d:
-                    position_ids = torch.tensor(
-                        [[mask_position, seq_length - context_length] for mask_position, context_length in
-                         zip(mask_positions, context_lengths)], dtype=torch.long, device=input_ids.device).unsqueeze(-1)
-                else:
-                    position_ids = torch.tensor([mask_position for mask_position in mask_positions], dtype=torch.long,
-                                                device=input_ids.device).unsqueeze(-1)
+            if position_ids is None:
+                position_ids = self.get_position_ids(input_ids, device=input_ids.device)
+            position_ids = position_ids[..., -1:]
 
             if past is None:
                 past = past_key_values
@@ -1145,30 +1064,16 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 "input_ids": last_token,
                 "past_key_values": past,
                 "position_ids": position_ids,
-                "attention_mask": attention_mask
+                "attention_mask": attention_mask,
+                **kwargs
             }
         else:
-            if attention_mask is not None and attention_mask.dtype != torch.bool:
-                logger.warning_once(f"The dtype of attention mask ({attention_mask.dtype}) is not bool")
-                attention_mask = None
-            if attention_mask is None:
-                attention_mask = self.get_masks(
-                    input_ids,
-                    device=input_ids.device
-                )
-            if position_ids is None:
-                position_ids = self.get_position_ids(
-                    input_ids,
-                    device=input_ids.device,
-                    mask_positions=mask_positions,
-                    use_gmasks=use_gmasks
-                )
-
             return {
                 "input_ids": input_ids,
                 "past_key_values": past,
                 "position_ids": position_ids,
-                "attention_mask": attention_mask
+                "attention_mask": attention_mask,
+                **kwargs
             }
 
     def forward(
@@ -1263,6 +1168,20 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             response = re.sub(r"%s([\u4e00-\u9fff])" % item[0], r"%s\1" % item[1], response)
         return response
 
+
+    def build_inputs(self, tokenizer, query: str, history: List[Tuple[str, str]] = None):
+        if not history:
+            prompt = query
+        else:
+            prompt = ""
+            for i, (old_query, response) in enumerate(history):
+                prompt += "[Round {}]\n问：{}\n答：{}\n".format(i, old_query, response)
+            prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
+        inputs = tokenizer([prompt], return_tensors="pt")
+        inputs = inputs.to(self.device)
+        return inputs
+
+
     @torch.no_grad()
     def chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, max_length: int = 2048, num_beams=1,
              do_sample=True, top_p=0.7, temperature=0.95, logits_processor=None, **kwargs):
@@ -1273,15 +1192,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         logits_processor.append(InvalidScoreLogitsProcessor())
         gen_kwargs = {"max_length": max_length, "num_beams": num_beams, "do_sample": do_sample, "top_p": top_p,
                       "temperature": temperature, "logits_processor": logits_processor, **kwargs}
-        if not history:
-            prompt = query
-        else:
-            prompt = ""
-            for i, (old_query, response) in enumerate(history):
-                prompt += "[Round {}]\n问：{}\n答：{}\n".format(i, old_query, response)
-            prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
-        inputs = tokenizer([prompt], return_tensors="pt")
-        inputs = inputs.to(self.device)
+        inputs = self.build_inputs(tokenizer, query, history=history)
         outputs = self.generate(**inputs, **gen_kwargs)
         outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]
         response = tokenizer.decode(outputs)
@@ -1299,15 +1210,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         logits_processor.append(InvalidScoreLogitsProcessor())
         gen_kwargs = {"max_length": max_length, "do_sample": do_sample, "top_p": top_p,
                       "temperature": temperature, "logits_processor": logits_processor, **kwargs}
-        if not history:
-            prompt = query
-        else:
-            prompt = ""
-            for i, (old_query, response) in enumerate(history):
-                prompt += "[Round {}]\n问：{}\n答：{}\n".format(i, old_query, response)
-            prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
-        inputs = tokenizer([prompt], return_tensors="pt")
-        inputs = inputs.to(self.device)
+        inputs = self.build_inputs(tokenizer, query, history=history)
         for outputs in self.stream_generate(**inputs, **gen_kwargs):
             outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]
             response = tokenizer.decode(outputs)
@@ -1433,3 +1336,145 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
         self.transformer = quantize(self.transformer, bits, empty_init=empty_init, **kwargs)
         return self
+
+
+class ChatGLMForConditionalGenerationWithImage(ChatGLMForConditionalGeneration):
+    def __init__(self, config: ChatGLMConfig, empty_init=True):
+        super().__init__(config, empty_init=empty_init)
+        from .visual import BLIP2
+        self.image_encoder = BLIP2(config.eva_config, config.qformer_config)
+        self.image_length = config.image_length
+
+    @staticmethod
+    def process_image(text, image=None):
+        '''Process image in text.
+        Args:
+            text: str, text.
+            image: Optional, image path / url / PIL image.
+        '''
+        from .visual import BlipImageEvalProcessor
+        from PIL import Image
+        from io import BytesIO
+
+        image_position = text.rfind("<img>") + 5
+        # extract path from <img></img> using re
+        image_path = re.findall(r"<img>(.*?)</img>", text)
+        image_path = image_path[-1] if image_path else None
+        if image_path is not None:
+            assert image is None, "image and image_path cannot be both not None."
+            text = text.replace(f"<img>{image_path}</img>", "<img></img>")
+            # url
+            if image_path.startswith("http"):
+                response = requests.get(image_path, timeout=10)
+                image = Image.open(BytesIO(response.content))
+            # local path
+            else:
+                image = Image.open(image_path)
+        if image is not None:
+            processor = BlipImageEvalProcessor(224)
+            image = processor(image.convert('RGB'))
+            image = image.unsqueeze(0)
+        return text, image_position, image
+
+    def build_inputs_with_image(self, tokenizer, image_path: str, query: str, history: List[Tuple[str, str]] = None):
+        image_path = image_path.strip()
+        if image_path:
+            prompt = "<img>{}</img>".format(image_path)
+        else:
+            prompt = ""
+        for i, (old_query, response) in enumerate(history):  # history removes image urls/paths, while query does not.
+            prompt += "问：{}\n答：{}\n".format(old_query, response)
+        prompt += "问：{}\n答：".format(query)
+        prompt, image_position, torch_image = self.process_image(prompt)
+        if torch_image is not None:
+            torch_image = torch_image.to(self.dtype).to(self.device)
+            input0 = tokenizer.encode(prompt[:image_position], add_special_tokens=False)
+            input1 = [tokenizer.unk_token_id] * self.image_length
+            input2 = tokenizer.encode(prompt[image_position:], add_special_tokens=False)
+            inputs = sum([input0, input1, input2], [])
+            inputs = {
+                "input_ids": torch.tensor([tokenizer.build_inputs_with_special_tokens(inputs)], dtype=torch.long).to(
+                    self.device),
+                "pre_image_length": len(input0),
+                "images": torch_image}
+        else:
+            inputs = tokenizer([prompt], return_tensors="pt")
+            inputs = inputs.to(self.device)
+            inputs["pre_image_length"] = 0
+        return inputs
+
+    @torch.no_grad()
+    def chat(self, tokenizer, image_path: str, query: str, history: List[Tuple[str, str]] = None, max_length: int = 1024,
+             min_length=100, do_sample=True, top_p=0.4, top_k=100, temperature=0.8, repetition_penalty=1.2, logits_processor=None, **kwargs):
+        if history is None:
+            history = []
+        if logits_processor is None:
+            logits_processor = LogitsProcessorList()
+        logits_processor.append(InvalidScoreLogitsProcessor())
+        gen_kwargs = {"max_length": max_length, "min_length": min_length, "do_sample": do_sample, "top_p": top_p,
+                      "top_k": top_k, "temperature": temperature, "repetition_penalty": repetition_penalty,
+                      "logits_processor": logits_processor, **kwargs}
+        inputs = self.build_inputs_with_image(tokenizer, image_path, query, history=history)
+        outputs = self.generate(**inputs, **gen_kwargs)
+        outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]
+        response = tokenizer.decode(outputs)
+        response = self.process_response(response)
+        history = history + [(query, response)]
+        return response, history
+
+
+    @torch.no_grad()
+    def stream_chat(self, tokenizer, image_path: str, query: str, history: List[Tuple[str, str]] = None,
+                    max_length: int = 1024, min_length=100, do_sample=True, top_p=0.4, top_k=100, temperature=0.8,
+                    repetition_penalty=1.2, logits_processor=None, **kwargs):
+        if history is None:
+            history = []
+        if logits_processor is None:
+            logits_processor = LogitsProcessorList()
+        logits_processor.append(InvalidScoreLogitsProcessor())
+        gen_kwargs = {"max_length": max_length, "min_length": min_length, "do_sample": do_sample, "top_p": top_p,
+                      "top_k": top_k, "temperature": temperature, "repetition_penalty": repetition_penalty,
+                      "logits_processor": logits_processor, **kwargs}
+        inputs = self.build_inputs_with_image(tokenizer, image_path, query, history=history)
+        for outputs in self.stream_generate(**inputs, **gen_kwargs):
+            outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]
+            response = tokenizer.decode(outputs)
+            response = self.process_response(response)
+            new_history = history + [(query, response)]
+            yield response, new_history
+
+    def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            images: Optional[torch.Tensor] = None,
+            pre_image_length: Optional[int] = None,
+            past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            labels: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+    ):
+        if inputs_embeds is None and past_key_values is None and images is not None:
+            image_embeds = self.image_encoder(images)
+            pre_id, pads, post_id = torch.tensor_split(input_ids,
+                                                       [pre_image_length, pre_image_length + self.image_length],
+                                                       dim=1)  # image after [Round 0]\n问：<img>
+            pre_txt_emb = self.transformer.word_embeddings(pre_id)
+            post_txt_emb = self.transformer.word_embeddings(post_id)
+            inputs_embeds = torch.cat([pre_txt_emb, image_embeds, post_txt_emb], dim=1)
+        return super().forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
